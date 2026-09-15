@@ -1,0 +1,18 @@
+.env
+.env.*
+!.env.example
+node_modules/
+__pycache__/
+*.pyc
+.venv/
+venv/
+dist/
+build/
+*.log
+.DS_Store
+Thumbs.db
+
+# Exported inventory data can contain pricing/customer info
+exports/
+*.csv
+!docs/**/*.csv
