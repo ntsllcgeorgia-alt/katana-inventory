@@ -1,12 +1,22 @@
 """
 Import NTP BigCommerce catalog into Katana MRP.
 
-Rule B+ (full path with cleanup):
-  - Only products in the 'All Products' tree get a category
-  - category_name = "Level2 > Level3 > Leaf" (strip 'All Products >' prefix)
-  - Admin/promo overlays (App Promotions, Fishbowl Product Export, Promotions,
-    Shop All (Legacy), Applications) are ignored for category assignment
-  - Products in admin-only or no category → category_name = null
+Category rule: Rule A (deepest leaf only).
+  Originally we used Rule B+ (full path "Level2 > Level3 > Leaf") but Katana's
+  category_name field has an undocumented ~36-char limit — anything longer
+  returns HTTP 500. Full paths like "Exterior > Rear Frame Accessories >
+  Stainless Steel Rear Light Panels" (69 chars) always fail. Empirically
+  verified: 35 chars OK, 38 chars fail.
+
+  So we use the leaf name only (e.g. "Stainless Steel Rear Light Panels").
+  Colliding leaf names (e.g. "Warning Lights" under both Lighting and Safety)
+  get disambiguated by appending "(parent)" — e.g. "Warning Lights (Safety)".
+  Names that still exceed 36 chars after collision handling are truncated
+  with an ellipsis.
+
+  Admin/promo overlays (App Promotions, Fishbowl Product Export, Promotions,
+  Shop All (Legacy), Applications) are ignored — products only in those get
+  no category (category_name omitted from payload).
 
 Data mapping (BC -> Katana):
   name              <- BC.name
@@ -76,28 +86,51 @@ def load_env(path):
     return env
 
 
-def http(method, url, headers=None, body=None, timeout=60):
-    """Simple HTTP wrapper. Returns (status, parsed_body, headers)."""
-    req = urllib.request.Request(url, method=method)
-    for k, v in (headers or {}).items():
-        req.add_header(k, v)
+def http(method, url, headers=None, body=None, timeout=30, retries=3):
+    """HTTP wrapper with retries + socket-level timeouts.
+
+    urllib.urlopen honors a `timeout` for the initial connect, but socket reads
+    can still stall on Windows if the server keeps the connection open without
+    sending data. We explicitly set the socket timeout as belt-and-suspenders,
+    then retry on any URLError with exponential backoff.
+    """
+    import socket
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
-        req.add_header("Content-Type", "application/json")
-    try:
-        with urllib.request.urlopen(req, data=data, timeout=timeout) as r:
-            raw = r.read().decode("utf-8")
-            return r.status, (json.loads(raw) if raw else None), dict(r.headers)
-    except urllib.error.HTTPError as e:
-        raw = e.read().decode("utf-8", errors="replace")
+    last_err = None
+    for attempt in range(retries):
+        req = urllib.request.Request(url, method=method)
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
+        if body is not None:
+            req.add_header("Content-Type", "application/json")
         try:
-            body_parsed = json.loads(raw)
-        except Exception:
-            body_parsed = raw
-        return e.code, body_parsed, dict(e.headers)
-    except urllib.error.URLError as e:
-        return -1, {"error": str(e)}, {}
+            # Set socket-level timeout too — urlopen's timeout can be defeated
+            # on Windows in some cases.
+            old_to = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(timeout)
+            try:
+                with urllib.request.urlopen(req, data=data, timeout=timeout) as r:
+                    raw = r.read().decode("utf-8")
+                    return r.status, (json.loads(raw) if raw else None), dict(r.headers)
+            finally:
+                socket.setdefaulttimeout(old_to)
+        except urllib.error.HTTPError as e:
+            # HTTP-level error is definitive — don't retry (e.g. 400/401/409)
+            raw = e.read().decode("utf-8", errors="replace")
+            try:
+                body_parsed = json.loads(raw)
+            except Exception:
+                body_parsed = raw
+            return e.code, body_parsed, dict(e.headers)
+        except (urllib.error.URLError, socket.timeout, TimeoutError, ConnectionError) as e:
+            last_err = e
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt)  # 1s, 2s, 4s
+                continue
+            return -1, {"error": f"{type(e).__name__}: {e}", "attempts": retries}, {}
+    return -1, {"error": str(last_err)}, {}
 
 
 def bc_get_all(env, path, params=""):
@@ -120,15 +153,21 @@ def bc_get_all(env, path, params=""):
     return out
 
 
-def build_category_maps(cats):
-    """Returns (id_to_full_path, allowed_ids_set).
+KATANA_CATEGORY_MAX_LEN = 36  # Undocumented: Katana returns HTTP 500 above ~36 chars
 
-    id_to_full_path: {cat_id: "Level2 > Level3 > Leaf"} for cats under All Products.
-    allowed_ids_set: cat_ids whose root is 'All Products' (the real taxonomy).
+def build_category_maps(cats):
+    """Returns (id_to_leaf, id_to_parent_name, allowed_ids).
+
+    Katana's category_name has an undocumented ~36-char limit — full paths like
+    "Exterior > Rear Frame Accessories > Stainless Steel Rear Light Panels" (69
+    chars) trigger HTTP 500. So we use Rule A (deepest leaf name only).
+
+    Leaf collisions are rare (e.g. "Warning Lights" exists under both Lighting
+    and Safety); we disambiguate collisions by appending the immediate parent.
     """
     by_id = {c["id"]: c for c in cats}
 
-    def full_path(cat_id):
+    def path_names(cat_id):
         names = []
         cur = by_id.get(cat_id)
         while cur:
@@ -139,34 +178,55 @@ def build_category_maps(cats):
                 cur = None
         return names
 
-    id_to_path = {}
+    id_to_leaf = {}
+    id_to_parent = {}
+    id_to_depth = {}
     allowed = set()
     for c in cats:
-        chain = full_path(c["id"])
-        if not chain:
+        chain = path_names(c["id"])
+        if not chain or chain[0] != "All Products" or len(chain) < 2:
             continue
-        if chain[0] == "All Products" and len(chain) > 1:
-            # strip the "All Products" root
-            id_to_path[c["id"]] = " > ".join(chain[1:])
-            allowed.add(c["id"])
-    return id_to_path, allowed
+        leaf = chain[-1]
+        parent = chain[-2] if len(chain) >= 2 else None
+        id_to_leaf[c["id"]] = leaf
+        id_to_parent[c["id"]] = parent
+        id_to_depth[c["id"]] = len(chain)  # actual tree depth
+        allowed.add(c["id"])
+
+    # Detect leaf name collisions across different parents
+    from collections import Counter
+    leaf_counts = Counter(id_to_leaf.values())
+    return id_to_leaf, id_to_parent, id_to_depth, allowed, leaf_counts
 
 
-def pick_category(product, id_to_path, allowed_ids):
-    """Return the category_name string for a BC product, or None.
+def truncate_cat(name):
+    """Truncate a category name to fit Katana's undocumented ~36-char limit."""
+    if not name:
+        return name
+    if len(name) <= KATANA_CATEGORY_MAX_LEN:
+        return name
+    return name[:KATANA_CATEGORY_MAX_LEN - 1].rstrip() + "…"
 
-    Rule: among the product's BC categories that are in the 'All Products' tree,
-    pick the DEEPEST (most specific). Break ties alphabetically for stability.
+
+def pick_category(product, id_to_leaf, id_to_parent, id_to_depth, allowed_ids, leaf_counts):
+    """Return the category_name (leaf-only) for a BC product, or None.
+
+    Rule A: pick the deepest All-Products category the product is in. Use its
+    leaf name. Disambiguate colliding leaves by appending "(parent)". Truncate
+    to Katana's 36-char limit if still too long.
     """
-    candidates = []
-    for cid in product.get("categories", []) or []:
-        if cid in allowed_ids:
-            path = id_to_path[cid]
-            candidates.append((path.count(">"), path))  # more '>' = deeper
+    candidates = [cid for cid in (product.get("categories") or []) if cid in allowed_ids]
     if not candidates:
         return None
-    candidates.sort(key=lambda x: (-x[0], x[1]))  # deepest first, then alpha
-    return candidates[0][1]
+    # Sort by actual tree depth (deepest first), then alphabetical on leaf for stability
+    candidates.sort(key=lambda cid: (-id_to_depth.get(cid, 0), id_to_leaf.get(cid, "")))
+    best = candidates[0]
+    leaf = id_to_leaf[best]
+    if leaf_counts[leaf] > 1:
+        parent = id_to_parent.get(best)
+        if parent:
+            leaf = f"{leaf} ({parent})"
+    return truncate_cat(leaf)
 
 
 def clean_description(html):
@@ -179,13 +239,25 @@ def clean_description(html):
 
 
 def build_katana_payload(product, category_name):
-    """BC product record -> Katana POST /products body."""
+    """BC product record -> Katana POST /products body.
+
+    Notes on gotchas found the hard way:
+      - category_name > 36 chars returns HTTP 500 (see truncate_cat)
+      - registered_barcode: null returns 422 (must be string) — OMIT the field
+        entirely when there's no UPC, don't send null.
+    """
     sku = str(product.get("sku") or "").strip()
-    upc = str(product.get("upc") or "").strip() or None
+    upc = str(product.get("upc") or "").strip()
     price = float(product.get("price") or 0)
-    return {
+    variant = {
+        "sku": sku,
+        "sales_price": price,
+        "purchase_price": 0,
+    }
+    if upc:  # only include if we have one — null triggers 422
+        variant["registered_barcode"] = upc
+    payload = {
         "name": (product.get("name") or "").strip()[:255],
-        "category_name": category_name,
         "additional_info": clean_description(product.get("description")),
         "uom": "pcs",
         "is_sellable": True,
@@ -193,15 +265,11 @@ def build_katana_payload(product, category_name):
         "is_producible": False,
         "batch_tracked": False,
         "serial_tracked": False,
-        "variants": [
-            {
-                "sku": sku,
-                "sales_price": price,
-                "purchase_price": 0,
-                "registered_barcode": upc,
-            }
-        ],
+        "variants": [variant],
     }
+    if category_name:  # omit key if null — cleaner
+        payload["category_name"] = category_name
+    return payload
 
 
 def katana_existing_skus(env):
@@ -270,8 +338,10 @@ def main():
     # 1. Load BC categories, build maps
     print("Fetching BC categories...", end=" ", flush=True)
     cats = bc_get_all(env, "catalog/categories")
-    id_to_path, allowed_ids = build_category_maps(cats)
-    print(f"{len(cats)} total, {len(allowed_ids)} under 'All Products' tree")
+    id_to_leaf, id_to_parent, id_to_depth, allowed_ids, leaf_counts = build_category_maps(cats)
+    collisions = sum(1 for c in leaf_counts.values() if c > 1)
+    print(f"{len(cats)} total, {len(allowed_ids)} under 'All Products' tree, "
+          f"{collisions} leaf-name collisions (disambiguated by parent)")
 
     # 2. Load BC products (with the fields we need)
     print("Fetching BC products (all fields)...", end=" ", flush=True)
@@ -317,7 +387,7 @@ def main():
         if sku in done_set:
             stats["skip_already_done"] += 1
             continue
-        cat = pick_category(p, id_to_path, allowed_ids)
+        cat = pick_category(p, id_to_leaf, id_to_parent, id_to_depth, allowed_ids, leaf_counts)
         if cat is None:
             stats["cat_null"] += 1
         else:
