@@ -16,3 +16,11 @@ Thumbs.db
 exports/
 *.csv
 !docs/**/*.csv
+
+# Import run logs and state
+logs/
+scripts/state/
+
+# Extracted pricing / MSRP data — sensitive, regenerable via scripts/
+imports/*.json
+imports/*.csv
